@@ -16,7 +16,7 @@ import (
 	"github.com/davecgh/go-spew/spew"
 	"github.com/gorilla/sessions"
 
-	"golang.org/x/net/context"
+	_ "golang.org/x/net/context"
 	"golang.org/x/oauth2"
 )
 
@@ -30,7 +30,7 @@ var sessionStoreKeyPairs = [][]byte{
 	nil,
 }
 
-var store = sessions.NewCookieStore(sessionStoreKeyPairs...)
+var store sessions.Store
 
 var (
 	clientID string
@@ -43,7 +43,13 @@ type User struct {
 }
 
 func init() {
+	// Create file system store with no size limit
+	fsStore := sessions.NewFilesystemStore("", sessionStoreKeyPairs...)
+	fsStore.MaxLength(0)
+	store = fsStore
+
 	gob.Register(&User{})
+	gob.Register(&oauth2.Token{})
 }
 
 func main() {
@@ -105,21 +111,21 @@ func (e Error) Error() string {
 func IndexHandler(w http.ResponseWriter, req *http.Request) error {
 	session, _ := store.Get(req, "session")
 
-	var user *User
+	var token *oauth2.Token
 	if req.FormValue("logout") != "" {
-		session.Values["user"] = nil
+		session.Values["token"] = nil
 		sessions.Save(req, w)
 	} else {
-		if v, ok := session.Values["user"]; ok {
-			user = v.(*User)
+		if v, ok := session.Values["token"]; ok {
+			token = v.(*oauth2.Token)
 		}
 	}
 
 	var data = struct {
-		User    *User
+		Token   *oauth2.Token
 		AuthURL string
 	}{
-		User:    user,
+		Token:   token,
 		AuthURL: config.AuthCodeURL(SessionState(session), oauth2.AccessTypeOnline),
 	}
 
@@ -136,15 +142,33 @@ var indexTempl = template.Must(template.New("").Parse(`<!DOCTYPE html>
   <body class="container-fluid">
     <div class="row">
       <div class="col-xs-4 col-xs-offset-4">
-	  	<h1>Azure AD OAuth2 Example</h1>
-{{with .User}}
-		<p>Welcome {{.DisplayName}}</p>
-		<a href="/?logout=true">Logout</a>
+        <h1>Azure AD OAuth2 Example</h1>
+{{with .Token}}
+        <div id="displayName"></div>
+        <a href="/?logout=true">Logout</a>
 {{else}}
-    	<a href="{{$.AuthURL}}">Login</a>
+        <a href="{{$.AuthURL}}">Login</a>
 {{end}}
       </div>
     </div>
+
+    <script src="https://code.jquery.com/jquery-3.2.1.min.js" integrity="sha256-hwg4gsxgFZhOsEEamdOYGBf13FyQuiTwlAQgxVSNgt4=" crossorigin="anonymous"></script>
+    <script>
+{{with .Token}}
+      var token = {{.}};
+
+      $.ajax({
+        url: 'https://graph.windows.net/me?api-version=1.6',
+        dataType: 'json',
+        success: function(data, status) {
+        	$('#displayName').text('Welcome ' + data.displayName);
+        },
+        beforeSend: function(xhr, settings) {
+          xhr.setRequestHeader('Authorization', 'Bearer ' + token.access_token);
+        }
+      });
+{{end}}
+    </script>
   </body>
 </html>
 `))
@@ -179,29 +203,12 @@ func CallbackHandler(w http.ResponseWriter, req *http.Request) error {
 		return fmt.Errorf("token response was %s", resp.Status)
 	}
 
-	var tok oauth2.Token
-	if err := json.NewDecoder(resp.Body).Decode(&tok); err != nil {
+	var token oauth2.Token
+	if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
 		return fmt.Errorf("error decoding JSON response: %v", err)
 	}
 
-	oauthClient := config.Client(context.TODO(), &tok)
-	resourceResp, err := oauthClient.Get("https://graph.windows.net/me?api-version=1.6")
-	if err != nil {
-		return fmt.Errorf("error retrieving user info: %v", err)
-	}
-	defer resourceResp.Body.Close()
-
-	var v map[string]interface{}
-	if err := json.NewDecoder(resourceResp.Body).Decode(&v); err != nil {
-		return fmt.Errorf("error decoding resource JSON response: %v", err)
-	}
-
-	user := &User{
-		Email:       v["mail"].(string),
-		DisplayName: v["displayName"].(string),
-	}
-
-	session.Values["user"] = user
+	session.Values["token"] = &token
 	if err := sessions.Save(req, w); err != nil {
 		return fmt.Errorf("error saving session: %v", err)
 	}
